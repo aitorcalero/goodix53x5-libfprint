@@ -188,6 +188,7 @@ goodix_verify_ssm_handler (FpiSsm   *ssm,
         /* Extract SIFT features once for both identify and verify paths */
         probe_info = goodix_match_extract (self->captured_image);
         keypoints = goodix_match_keypoints_count (probe_info);
+        fp_dbg ("Verification capture extracted %d SIGFM keypoints", keypoints);
 
         if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
           {
@@ -438,7 +439,11 @@ goodix_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   self->task_ssm = NULL;
   self->blocking_ssm = NULL;
-  g_clear_pointer (&self->reference_image, g_free);
+  /* Keep the pre-touch reference for fprintd's IDENTIFY -> ENROLL duplicate
+   * check transition. Other actions and close discard it as usual. */
+  if (error != NULL || action != FPI_DEVICE_ACTION_IDENTIFY ||
+      !(fpi_device_get_driver_data (dev) & GOODIX53X5_FLAG_MILAN_F_5381))
+    g_clear_pointer (&self->reference_image, g_free);
   g_clear_pointer (&self->captured_image, g_free);
 
   if (error)
