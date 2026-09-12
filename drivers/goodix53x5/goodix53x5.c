@@ -123,6 +123,9 @@ fpi_device_goodix53x5_init (FpiDeviceGoodix53x5 *self)
 
 static const FpIdEntry goodix53x5_id_table[] = {
   { .vid = 0x27c6, .pid = 0x5335, },
+  { .vid = 0x27c6, .pid = 0x5381,
+    .driver_data = GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN |
+                   GOODIX53X5_FLAG_MILAN_F_5381, },
   { .vid = 0x27c6, .pid = 0x5385, },
   { .vid = 0x27c6, .pid = 0x5395, },
   { .vid = 0, .pid = 0, .driver_data = 0 },
