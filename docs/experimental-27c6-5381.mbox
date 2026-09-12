@@ -1,0 +1,1933 @@
+From be924b8c57b8846d3e2bb1ae807be815d7212aa0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Mon, 7 Sep 2026 21:54:51 +0200
+Subject: [PATCH 1/7] Add guarded experimental support for Goodix 5381
+
+---
+ README.md                                   | 26 +++++-
+ docs/27c6-5381-porting.md                   | 47 ++++++++++
+ drivers/goodix53x5/goodix53x5-calibration.c | 12 +++
+ drivers/goodix53x5/goodix53x5-private.h     |  7 ++
+ drivers/goodix53x5/goodix53x5-session.c     | 95 ++++++++++++++++++++-
+ drivers/goodix53x5/goodix53x5.c             |  2 +
+ meson-integration.patch                     | 11 +--
+ 7 files changed, 189 insertions(+), 11 deletions(-)
+ create mode 100644 docs/27c6-5381-porting.md
+
+diff --git a/README.md b/README.md
+index 310cc5f..31cda5e 100644
+--- a/README.md
++++ b/README.md
+@@ -1,19 +1,37 @@
+-# Goodix HTK32 (27c6:5335 / 27c6:5385 / 27c6:5395) libfprint Driver
++# Goodix HTK32 (27c6:5335 / 27c6:5381 / 27c6:5385 / 27c6:5395) libfprint Driver
+ 
+-A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570** and possibly other laptops using the `27c6:5335`, `27c6:5385` or `27c6:5395` USB device.
++A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570** and possibly other laptops using the `27c6:5335`, `27c6:5381`, `27c6:5385` or `27c6:5395` USB device. Support for `27c6:5381` is experimental and initially blocks persistent PSK changes.
+ 
+ ## Hardware
+ 
+ - **Vendor ID:** `0x27c6`
+-- **Product IDs:** `0x5335`, `0x5385`, `0x5395`
++- **Product IDs:** `0x5335`, `0x5381` (experimental), `0x5385`, `0x5395`
+ - **Sensor:** 108 x 88 pixels, capacitive press-type
+ - **Known devices:** Dell XPS 13 9305, Dell XPS 13 7390 2-in-1, Dell XPS 15 9570
+ 
+ Check if you have this sensor:
+ ```
+-lsusb | grep -E '27c6:(5335|5385|5395)'
++lsusb | grep -E '27c6:(5335|5381|5385|5395)'
+ ```
+ 
++### Experimental 27c6:5381 support
++
++The `27c6:5381` uses the same interface number, bulk endpoints and packet size
++as the supported HTK32 devices, but its protocol has not yet been validated.
++The driver therefore runs a read-only probe and stops after reading the
++firmware version, chip ID, OTP layout and current PSK state. It refuses full
++initialization unless `GOODIX53X5_ALLOW_FULL_INIT=1` is present in the
++`fprintd` environment. If the PSK also needs replacement, the separate
++`GOODIX53X5_ALLOW_PSK_WRITE=1` opt-in is required before the potentially
++irreversible change needed for the GTLS handshake.
++
++Only after reviewing a successful probe should a tester enable either option.
++A PSK replacement can affect compatibility with the Windows driver and must
++not be enabled merely to see whether the device is detected.
++
++See [`docs/27c6-5381-porting.md`](docs/27c6-5381-porting.md) for the hardware
++probe and calibration evidence behind this experimental entry.
++
+ ## How It Works
+ 
+ The sensor provides raw 12-bit capacitive images encrypted with a TLS-like protocol (GTLS). The driver:
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+new file mode 100644
+index 0000000..b0170a5
+--- /dev/null
++++ b/docs/27c6-5381-porting.md
+@@ -0,0 +1,47 @@
++# Goodix 27c6:5381 porting notes
++
++These notes document the evidence used for the initial experimental port. They
++do not contain firmware, biometric data, or a device-specific PSK.
++
++## Tested hardware
++
++- Laptop: Dell G5 15 5587
++- USB ID: `27c6:5381`
++- USB data interface: 1
++- Bulk endpoints: `0x03` OUT and `0x81` IN
++- Maximum bulk packet size: 64 bytes
++- Firmware: `GF5288_HTSEC_APP_10020`
++- Chip ID: `0x002202a0`
++- OTP reply length: 32 bytes
++
++The interface, endpoints, packet size and wrapless protocol match the existing
++53x5 driver. Ping, firmware query, reset, chip-ID query, OTP read and PSK-hash
++read all complete successfully.
++
++## Calibration evidence
++
++Dell publishes Goodix driver `KP8ND`, version `3.31.30.110 A08`, for the Dell G5
++15 5587. Its SHA-256 is
++`701572c668467ef14bad3e4c6d21ae726bf0764a1093cd2c1951fafe200f9b6a`, matching
++the checksum on Dell's download page.
++
++Static comparison of the package's separate `PID5381` and `PID5395` modules
++shows that both contain the exact 256-byte configuration already used by this
++driver. The `PID5381` module also uses the same OTP offsets and formulas for
++`tcode`, FDT deltas and DAC values. Its path accepts the chip OTP without the
++single-byte hash check used by the reverse-engineered `5395` utility. This is
++consistent with the test device: its 32-byte OTP does not validate under the
++`5395` hash rule, while the calibration fields select the driver's documented
++fallback values.
++
++## PSK safety
++
++The test device still has its factory per-machine PSK. The open driver cannot
++establish GTLS without that key, so the existing 53x5 design replaces it with
++the known all-zero PSK. That write is persistent and can affect later Windows
++compatibility. For `27c6:5381`, the driver therefore stops after its read-only
++probe unless full initialization is explicitly enabled. A second independent
++opt-in is required before a PSK write.
++
++No PSK replacement or firmware write was performed while gathering these
++notes.
+diff --git a/drivers/goodix53x5/goodix53x5-calibration.c b/drivers/goodix53x5/goodix53x5-calibration.c
+index 0f2e982..f82b729 100644
+--- a/drivers/goodix53x5/goodix53x5-calibration.c
++++ b/drivers/goodix53x5/goodix53x5-calibration.c
+@@ -163,6 +163,18 @@ goodix_device_verify_otp (const guint8 *otp,
+     {
+       fp_warn ("OTP hash mismatch: received 0x%02x, computed 0x%02x",
+                received_hash, computed_hash);
++
++      /* Different HTK32 revisions may store the checksum at another offset.
++       * Report candidates without exposing the OTP contents. */
++      for (gsize hash_offset = 0; hash_offset < otp_len; hash_offset++)
++        {
++          memcpy (data, otp, hash_offset);
++          memcpy (data + hash_offset, otp + hash_offset + 1,
++                  otp_len - hash_offset - 1);
++          if (otp[hash_offset] ==
++              goodix_device_compute_otp_hash (data, data_len))
++            fp_warn ("Possible OTP hash byte at offset %zu", hash_offset);
++        }
+       return FALSE;
+     }
+ 
+diff --git a/drivers/goodix53x5/goodix53x5-private.h b/drivers/goodix53x5/goodix53x5-private.h
+index 232a02a..361af59 100644
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -68,6 +68,13 @@
+ /* PSK white box for writing all-zero PSK */
+ #define GOODIX_PSK_WHITE_BOX_LEN 96
+ 
++/* Device-specific safety flags carried through FpIdEntry.driver_data. */
++#define GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN (1u << 0)
++
++#define GOODIX5381_FIRMWARE "GF5288_HTSEC_APP_10020"
++#define GOODIX5381_CHIP_ID  0x002202a0u
++#define GOODIX5381_OTP_LEN  32u
++
+ /* --- Calibration parameters (from OTP) --- */
+ typedef struct
+ {
+diff --git a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+index c231c81..2914792 100644
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -31,6 +31,13 @@
+ 
+ #define GOODIX_OPEN_FDT_MAX_RETRIES 2
+ 
++static gboolean
++goodix_is_experimental_5381 (FpDevice *dev)
++{
++  return (fpi_device_get_driver_data (dev) &
++          GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN) != 0;
++}
++
+ /* Open SSM — full device initialization */
+ typedef enum {
+   GOODIX_OPEN_USB_RESET = 0,
+@@ -146,6 +153,19 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         g_clear_pointer (&self->fw_version, g_free);
+         self->fw_version = g_strndup ((const gchar *) pl,
+                                       strnlen ((const gchar *) pl, pl_len));
++        fp_info ("Firmware version: %s", self->fw_version);
++
++        if (goodix_is_experimental_5381 (dev) &&
++            g_strcmp0 (self->fw_version, GOODIX5381_FIRMWARE) != 0)
++          {
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (
++                FP_DEVICE_ERROR_NOT_SUPPORTED,
++                "Unsupported 27c6:5381 firmware: %s (expected %s)",
++                self->fw_version, GOODIX5381_FIRMWARE));
++            return;
++          }
+ 
+         goodix_cmd_reset_sensor (ssm, dev);
+       }
+@@ -181,6 +201,18 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         chip_id = goodix_crypto_decode_u32 (pl);
+         fp_dbg ("Chip ID: 0x%08x", chip_id);
+ 
++        if (goodix_is_experimental_5381 (dev) &&
++            chip_id != GOODIX5381_CHIP_ID)
++          {
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (
++                FP_DEVICE_ERROR_NOT_SUPPORTED,
++                "Unsupported 27c6:5381 chip ID: 0x%08x (expected 0x%08x)",
++                chip_id, GOODIX5381_CHIP_ID));
++            return;
++          }
++
+         goodix_cmd_read_otp (ssm, dev);
+       }
+       break;
+@@ -202,7 +234,20 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         self->otp_data = g_memdup2 (pl, pl_len);
+         self->otp_len = pl_len;
+ 
+-        if (!goodix_device_verify_otp (pl, pl_len))
++        if (goodix_is_experimental_5381 (dev) &&
++            pl_len != GOODIX5381_OTP_LEN)
++          {
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (
++                FP_DEVICE_ERROR_PROTO,
++                "Unexpected 27c6:5381 OTP length: %zu (expected %u)",
++                pl_len, GOODIX5381_OTP_LEN));
++            return;
++          }
++
++        if (!goodix_device_verify_otp (pl, pl_len) &&
++            !goodix_is_experimental_5381 (dev))
+           {
+             fpi_ssm_mark_failed (ssm,
+                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+@@ -210,6 +255,21 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        if (goodix_is_experimental_5381 (dev))
++          {
++            fp_info ("Experimental 27c6:5381 OTP length: %zu bytes", pl_len);
++            if (g_strcmp0 (g_getenv ("GOODIX53X5_DUMP_OTP"), "1") == 0)
++              {
++                g_autoptr(GString) otp_hex = g_string_sized_new (pl_len * 3);
++
++                for (gsize i = 0; i < pl_len; i++)
++                  g_string_append_printf (otp_hex, "%s%02x",
++                                          i == 0 ? "" : " ", pl[i]);
++                fp_info ("Experimental 27c6:5381 OTP bytes: %s",
++                         otp_hex->str);
++              }
++          }
++
+         goodix_device_parse_otp (pl, pl_len, &self->calib);
+         fpi_ssm_next_state (ssm);
+       }
+@@ -241,11 +301,30 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+           g_autoptr(GChecksum) sha = g_checksum_new (G_CHECKSUM_SHA256);
+           guint8 expected_hash[32];
+           gsize hash_len = 32;
++          gboolean psk_matches;
+ 
+           g_checksum_update (sha, goodix_psk, GOODIX_PSK_LEN);
+           g_checksum_get_digest (sha, expected_hash, &hash_len);
++          psk_matches = psk_data_len >= 32 &&
++                        memcmp (psk_data, expected_hash, 32) == 0;
+ 
+-          if (psk_data_len >= 32 && memcmp (psk_data, expected_hash, 32) == 0)
++          if (goodix_is_experimental_5381 (dev) &&
++              g_strcmp0 (g_getenv ("GOODIX53X5_ALLOW_FULL_INIT"), "1") != 0)
++            {
++              fpi_ssm_mark_failed (
++                ssm,
++                fpi_device_error_new_msg (
++                  FP_DEVICE_ERROR_NOT_SUPPORTED,
++                  "27c6:5381 read-only probe complete: firmware=%s, "
++                  "OTP=%zu bytes, PSK=%s; refusing full "
++                  "initialization unless GOODIX53X5_ALLOW_FULL_INIT=1",
++                  self->fw_version ? self->fw_version : "unknown",
++                  self->otp_len,
++                  psk_matches ? "compatible" : "different"));
++              return;
++            }
++
++          if (psk_matches)
+             {
+               fp_dbg ("PSK hash matches, no need to write");
+               self->psk_write_verify_pending = FALSE;
+@@ -255,6 +334,18 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         }
+ 
+         /* Need to write PSK white box */
++        if (goodix_is_experimental_5381 (dev) &&
++            g_strcmp0 (g_getenv ("GOODIX53X5_ALLOW_PSK_WRITE"), "1") != 0)
++          {
++            fpi_ssm_mark_failed (
++              ssm,
++              fpi_device_error_new_msg (
++                FP_DEVICE_ERROR_NOT_SUPPORTED,
++                "The untested 27c6:5381 sensor requires a persistent PSK "
++                "change; refusing it unless GOODIX53X5_ALLOW_PSK_WRITE=1"));
++            return;
++          }
++
+         fp_info ("Writing PSK white box");
+         self->psk_write_verify_pending = TRUE;
+         goodix_cmd_production_write (ssm, dev, 0xB002, goodix_psk_white_box,
+diff --git a/drivers/goodix53x5/goodix53x5.c b/drivers/goodix53x5/goodix53x5.c
+index 004a411..b2bd348 100644
+--- a/drivers/goodix53x5/goodix53x5.c
++++ b/drivers/goodix53x5/goodix53x5.c
+@@ -123,6 +123,8 @@ fpi_device_goodix53x5_init (FpiDeviceGoodix53x5 *self)
+ 
+ static const FpIdEntry goodix53x5_id_table[] = {
+   { .vid = 0x27c6, .pid = 0x5335, },
++  { .vid = 0x27c6, .pid = 0x5381,
++    .driver_data = GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN, },
+   { .vid = 0x27c6, .pid = 0x5385, },
+   { .vid = 0x27c6, .pid = 0x5395, },
+   { .vid = 0, .pid = 0, .driver_data = 0 },
+diff --git a/meson-integration.patch b/meson-integration.patch
+index bd9502a..2596301 100644
+--- a/meson-integration.patch
++++ b/meson-integration.patch
+@@ -88,12 +88,13 @@ diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+ index 6c15fb9..2bc8a69 100644
+ --- a/data/autosuspend.hwdb
+ +++ b/data/autosuspend.hwdb
+-@@ -201,6 +201,13 @@ usb:v10A5pC844*
++@@ -201,6 +201,14 @@ usb:v10A5pC844*
+   ID_AUTOSUSPEND=1
+   ID_PERSIST=0
+  
+ +# Supported by libfprint driver goodix53x5
+ +usb:v27C6p5335*
+++usb:v27C6p5381*
+ +usb:v27C6p5385*
+ +usb:v27C6p5395*
+ + ID_AUTOSUSPEND=1
+@@ -102,13 +103,13 @@ index 6c15fb9..2bc8a69 100644
+  # Supported by libfprint driver goodixmoc
+  usb:v27C6p5840*
+  usb:v27C6p6014*
+-@@ -453,13 +460,10 @@ usb:v27C6p521D*
++@@ -453,13 +461,9 @@ usb:v27C6p521D*
+  usb:v27C6p5301*
+  usb:v27C6p530C*
+  usb:v27C6p532D*
+ -usb:v27C6p5335*
+  usb:v27C6p533C*
+- usb:v27C6p5381*
++-usb:v27C6p5381*
+ -usb:v27C6p5385*
+  usb:v27C6p538C*
+  usb:v27C6p538D*
+@@ -120,13 +121,13 @@ diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb
+ index 0527db1..097ddfb 100644
+ --- a/libfprint/fprint-list-udev-hwdb.c
+ +++ b/libfprint/fprint-list-udev-hwdb.c
+-@@ -133,13 +133,10 @@ static const FpIdEntry allowlist_id_table[] = {
++@@ -133,13 +133,9 @@ static const FpIdEntry allowlist_id_table[] = {
+    { .vid = 0x27c6, .pid = 0x5301 },
+    { .vid = 0x27c6, .pid = 0x530c },
+    { .vid = 0x27c6, .pid = 0x532d },
+ -  { .vid = 0x27c6, .pid = 0x5335 },
+    { .vid = 0x27c6, .pid = 0x533c },
+-   { .vid = 0x27c6, .pid = 0x5381 },
++-  { .vid = 0x27c6, .pid = 0x5381 },
+ -  { .vid = 0x27c6, .pid = 0x5385 },
+    { .vid = 0x27c6, .pid = 0x538c },
+    { .vid = 0x27c6, .pid = 0x538d },
+-- 
+2.55.0
+
+
+From 1fd1a0b91cfff412cc227a1ea6958ef9dee8ce7f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Tue, 8 Sep 2026 00:31:13 +0200
+Subject: [PATCH 2/7] Use Milan F protocol for Goodix 5381
+
+---
+ README.md                                   | 16 +++----
+ docs/27c6-5381-porting.md                   | 24 +++++++---
+ drivers/goodix53x5/goodix53x5-calibration.c | 50 ++++++++++++++++++++-
+ drivers/goodix53x5/goodix53x5-calibration.h |  3 +-
+ drivers/goodix53x5/goodix53x5-commands.c    | 12 +++++
+ drivers/goodix53x5/goodix53x5-private.h     |  1 +
+ drivers/goodix53x5/goodix53x5-session.c     |  5 ++-
+ drivers/goodix53x5/goodix53x5.c             |  3 +-
+ 8 files changed, 93 insertions(+), 21 deletions(-)
+
+diff --git a/README.md b/README.md
+index 31cda5e..91c1310 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,13 @@
+ # Goodix HTK32 (27c6:5335 / 27c6:5381 / 27c6:5385 / 27c6:5395) libfprint Driver
+ 
+-A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570** and possibly other laptops using the `27c6:5335`, `27c6:5381`, `27c6:5385` or `27c6:5395` USB device. Support for `27c6:5381` is experimental and initially blocks persistent PSK changes.
++A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570**, the **Dell G5 15 5587** and possibly other laptops using the `27c6:5335`, `27c6:5381`, `27c6:5385` or `27c6:5395` USB device. Support for `27c6:5381` is experimental and guards persistent PSK changes behind a separate opt-in.
+ 
+ ## Hardware
+ 
+ - **Vendor ID:** `0x27c6`
+ - **Product IDs:** `0x5335`, `0x5381` (experimental), `0x5385`, `0x5395`
+ - **Sensor:** 108 x 88 pixels, capacitive press-type
+-- **Known devices:** Dell XPS 13 9305, Dell XPS 13 7390 2-in-1, Dell XPS 15 9570
++- **Known devices:** Dell XPS 13 9305, Dell XPS 13 7390 2-in-1, Dell XPS 15 9570, Dell G5 15 5587
+ 
+ Check if you have this sensor:
+ ```
+@@ -16,12 +16,12 @@ lsusb | grep -E '27c6:(5335|5381|5385|5395)'
+ 
+ ### Experimental 27c6:5381 support
+ 
+-The `27c6:5381` uses the same interface number, bulk endpoints and packet size
+-as the supported HTK32 devices, but its protocol has not yet been validated.
+-The driver therefore runs a read-only probe and stops after reading the
+-firmware version, chip ID, OTP layout and current PSK state. It refuses full
+-initialization unless `GOODIX53X5_ALLOW_FULL_INIT=1` is present in the
+-`fprintd` environment. If the PSK also needs replacement, the separate
++The `27c6:5381` uses the Milan F protocol variant, configuration table entry 0
++and chip ID `0x002202a0`. Initialization, GTLS, FDT setup and an encrypted
++108x88 reference capture have been validated on a Dell G5 15 5587. Enrollment
++still needs broader testing, so the driver refuses full initialization unless
++`GOODIX53X5_ALLOW_FULL_INIT=1` is present in the `fprintd` environment. If the
++PSK also needs replacement, the separate
+ `GOODIX53X5_ALLOW_PSK_WRITE=1` opt-in is required before the potentially
+ irreversible change needed for the GTLS handshake.
+ 
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+index b0170a5..1e8317d 100644
+--- a/docs/27c6-5381-porting.md
++++ b/docs/27c6-5381-porting.md
+@@ -26,8 +26,10 @@ Dell publishes Goodix driver `KP8ND`, version `3.31.30.110 A08`, for the Dell G5
+ the checksum on Dell's download page.
+ 
+ Static comparison of the package's separate `PID5381` and `PID5395` modules
+-shows that both contain the exact 256-byte configuration already used by this
+-driver. The `PID5381` module also uses the same OTP offsets and formulas for
++shows that both contain a ten-entry configuration table. The existing driver
++used entry 9, while the `0x2202` Milan F path selects entry 0. It also uses a
++fixed two-byte image-prepare payload (`01 00`) instead of the four-byte Milan
++FNHV payload. The `PID5381` module uses the same OTP offsets and formulas for
+ `tcode`, FDT deltas and DAC values. Its path accepts the chip OTP without the
+ single-byte hash check used by the reverse-engineered `5395` utility. This is
+ consistent with the test device: its 32-byte OTP does not validate under the
+@@ -36,12 +38,20 @@ fallback values.
+ 
+ ## PSK safety
+ 
+-The test device still has its factory per-machine PSK. The open driver cannot
+-establish GTLS without that key, so the existing 53x5 design replaces it with
+-the known all-zero PSK. That write is persistent and can affect later Windows
++The test device's factory per-machine PSK was replaced with the known all-zero
++PSK after explicit opt-in. The write was re-read and its SHA-256 verified before
++GTLS was attempted. That write is persistent and can affect later Windows
+ compatibility. For `27c6:5381`, the driver therefore stops after its read-only
+ probe unless full initialization is explicitly enabled. A second independent
+ opt-in is required before a PSK write.
+ 
+-No PSK replacement or firmware write was performed while gathering these
+-notes.
++No firmware write was performed.
++
++## Live validation
++
++With configuration entry 0 and the Milan F image request, the device completed
++GTLS, configuration upload, FDT calibration and a full encrypted reference
++capture. The capture passed both the encrypted-payload HMAC and the GEA image
++CRC. The enrollment state machine then armed FDT and waited for a finger. The
++interactive test was cancelled after no finger was presented, so finger-image
++quality, feature extraction and an eight-stage enrollment remain to be tested.
+diff --git a/drivers/goodix53x5/goodix53x5-calibration.c b/drivers/goodix53x5/goodix53x5-calibration.c
+index f82b729..caefc20 100644
+--- a/drivers/goodix53x5/goodix53x5-calibration.c
++++ b/drivers/goodix53x5/goodix53x5-calibration.c
+@@ -62,7 +62,43 @@ static const guint8 otp_hash_table[256] = {
+   0xe6, 0xe1, 0xe8, 0xef, 0xfa, 0xfd, 0xf4, 0xf3,
+ };
+ 
+-/* Default configuration (from driver_53x5.py DEFAULT_CONFIG) */
++/* Milan F configuration table entry 0 used by chip 0x2202 / USB 5381. */
++static const guint8 milan_f_5381_default_config[] = {
++  0x00, 0x11, 0x54, 0x65, 0x24, 0x89, 0x24, 0xad,
++  0x1c, 0xc9, 0x1c, 0xe5, 0x04, 0xe9, 0x04, 0xed,
++  0x13, 0xba, 0x00, 0x01, 0x00, 0xca, 0x00, 0x07,
++  0x00, 0x84, 0x00, 0x7f, 0x81, 0x86, 0x00, 0x7f,
++  0x8c, 0x88, 0x00, 0x7f, 0x97, 0x8a, 0x00, 0x7f,
++  0xb0, 0x8c, 0x00, 0x7f, 0x86, 0x8e, 0x00, 0x7f,
++  0x8c, 0x90, 0x00, 0x7f, 0xa0, 0x92, 0x00, 0x7f,
++  0xb3, 0x94, 0x00, 0x7f, 0x84, 0x96, 0x00, 0x7f,
++  0x88, 0x98, 0x00, 0x7f, 0xa0, 0x9a, 0x00, 0x7f,
++  0xb8, 0x56, 0x00, 0x08, 0x28, 0x58, 0x00, 0x48,
++  0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78,
++  0x56, 0x74, 0x00, 0x34, 0x12, 0x26, 0x00, 0x00,
++  0x12, 0xd0, 0x00, 0x00, 0x00, 0x20, 0x01, 0x02,
++  0x04, 0x20, 0x00, 0x10, 0x40, 0x22, 0x00, 0x01,
++  0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01,
++  0x04, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80,
++  0x15, 0x20, 0x01, 0x82, 0x04, 0x20, 0x00, 0x10,
++  0x40, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14,
++  0x00, 0x80, 0x00, 0x01, 0x04, 0x5c, 0x00, 0x00,
++  0x01, 0x28, 0x02, 0x00, 0x00, 0x2a, 0x02, 0x00,
++  0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x08,
++  0x04, 0x22, 0x00, 0x10, 0x08, 0x80, 0x00, 0x01,
++  0x00, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80,
++  0x15, 0x20, 0x01, 0x08, 0x04, 0x5c, 0x00, 0x80,
++  0x00, 0x50, 0x00, 0x01, 0x05, 0x52, 0x00, 0x08,
++  0x00, 0x54, 0x00, 0x10, 0x01, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* Milan FNHV configuration table entry 9. */
+ static const guint8 default_config[] = {
+   0x40, 0x11, 0x6c, 0x7d, 0x28, 0xa5, 0x28, 0xcd,
+   0x1c, 0xe9, 0x10, 0xf9, 0x00, 0xf9, 0x00, 0xf9,
+@@ -98,6 +134,9 @@ static const guint8 default_config[] = {
+   0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x4f,
+ };
+ 
++G_STATIC_ASSERT (sizeof (milan_f_5381_default_config) == 256);
++G_STATIC_ASSERT (sizeof (default_config) == 256);
++
+ /* Config tag constants */
+ #define TCODE_TAG      0x5C
+ #define DAC_L_TAG      0x220
+@@ -109,8 +148,15 @@ static const guint8 default_config[] = {
+  * Return a pointer to the default config and its length.
+  */
+ const guint8 *
+-goodix_device_get_default_config (gsize *out_len)
++goodix_device_get_default_config (gboolean milan_f_5381,
++                                  gsize   *out_len)
+ {
++  if (milan_f_5381)
++    {
++      *out_len = sizeof (milan_f_5381_default_config);
++      return milan_f_5381_default_config;
++    }
++
+   *out_len = sizeof (default_config);
+   return default_config;
+ }
+diff --git a/drivers/goodix53x5/goodix53x5-calibration.h b/drivers/goodix53x5/goodix53x5-calibration.h
+index 0071d4a..4c9e91a 100644
+--- a/drivers/goodix53x5/goodix53x5-calibration.h
++++ b/drivers/goodix53x5/goodix53x5-calibration.h
+@@ -52,4 +52,5 @@ void     goodix_device_generate_fdt_up_base (const guint8        *fdt_data,
+                                              const GoodixCalibParams *params,
+                                              guint8              *fdt_base_up);
+ 
+-const guint8 *goodix_device_get_default_config (gsize *out_len);
++const guint8 *goodix_device_get_default_config (gboolean milan_f_5381,
++                                                gsize   *out_len);
+diff --git a/drivers/goodix53x5/goodix53x5-commands.c b/drivers/goodix53x5/goodix53x5-commands.c
+index 2284afc..51a8787 100644
+--- a/drivers/goodix53x5/goodix53x5-commands.c
++++ b/drivers/goodix53x5/goodix53x5-commands.c
+@@ -227,6 +227,18 @@ goodix_cmd_request_image (FpiSsm *ssm, FpDevice *dev,
+                           gboolean tx_enable, gboolean hv_enable,
+                           gboolean is_finger, guint16 dac)
+ {
++  /* Milan F (chip 0x2202 / USB 5381) has a separate image-prepare
++   * operation.  The official PID5381 driver always sends { 0x01, 0x00 }
++   * here; the four-byte mode/HV/DAC request belongs to Milan FNHV. */
++  if ((fpi_device_get_driver_data (dev) &
++       GOODIX53X5_FLAG_MILAN_F_5381) != 0)
++    {
++      guint8 img_req[2] = { 0x01, 0x00 };
++
++      goodix_run_cmd (ssm, dev, 0x2, 0x0, img_req, sizeof (img_req), TRUE);
++      return;
++    }
++
+   guint8 img_req[4];
+ 
+   goodix_build_image_request (tx_enable, hv_enable, is_finger, dac, img_req);
+diff --git a/drivers/goodix53x5/goodix53x5-private.h b/drivers/goodix53x5/goodix53x5-private.h
+index 361af59..780dcf8 100644
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -70,6 +70,7 @@
+ 
+ /* Device-specific safety flags carried through FpIdEntry.driver_data. */
+ #define GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN (1u << 0)
++#define GOODIX53X5_FLAG_MILAN_F_5381              (1u << 1)
+ 
+ #define GOODIX5381_FIRMWARE "GF5288_HTSEC_APP_10020"
+ #define GOODIX5381_CHIP_ID  0x002202a0u
+diff --git a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+index 2914792..f9acbe0 100644
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -35,7 +35,7 @@ static gboolean
+ goodix_is_experimental_5381 (FpDevice *dev)
+ {
+   return (fpi_device_get_driver_data (dev) &
+-          GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN) != 0;
++          GOODIX53X5_FLAG_MILAN_F_5381) != 0;
+ }
+ 
+ /* Open SSM — full device initialization */
+@@ -527,7 +527,8 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+ 
+         /* Build and upload config */
+         gsize cfg_len;
+-        const guint8 *def_cfg = goodix_device_get_default_config (&cfg_len);
++        const guint8 *def_cfg = goodix_device_get_default_config (
++            goodix_is_experimental_5381 (dev), &cfg_len);
+         guint8 *cfg = g_memdup2 (def_cfg, cfg_len);
+ 
+         goodix_device_patch_config (cfg, cfg_len, &self->calib);
+diff --git a/drivers/goodix53x5/goodix53x5.c b/drivers/goodix53x5/goodix53x5.c
+index b2bd348..df4c5de 100644
+--- a/drivers/goodix53x5/goodix53x5.c
++++ b/drivers/goodix53x5/goodix53x5.c
+@@ -124,7 +124,8 @@ fpi_device_goodix53x5_init (FpiDeviceGoodix53x5 *self)
+ static const FpIdEntry goodix53x5_id_table[] = {
+   { .vid = 0x27c6, .pid = 0x5335, },
+   { .vid = 0x27c6, .pid = 0x5381,
+-    .driver_data = GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN, },
++    .driver_data = GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN |
++                   GOODIX53X5_FLAG_MILAN_F_5381, },
+   { .vid = 0x27c6, .pid = 0x5385, },
+   { .vid = 0x27c6, .pid = 0x5395, },
+   { .vid = 0, .pid = 0, .driver_data = 0 },
+-- 
+2.55.0
+
+
+From 556621369bd872c3ec39cd4c394042805d4939b8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Tue, 8 Sep 2026 10:08:28 +0200
+Subject: [PATCH 3/7] Complete image processing for Goodix 5381
+
+---
+ .gitignore                              |  3 ++
+ README.md                               | 12 ++---
+ docs/27c6-5381-porting.md               | 36 ++++++++++++---
+ drivers/goodix53x5/goodix53x5-auth.c    |  1 +
+ drivers/goodix53x5/goodix53x5-enroll.c  | 12 ++++-
+ drivers/goodix53x5/goodix53x5-image.c   | 58 +++++++++++++++++++++++++
+ drivers/goodix53x5/goodix53x5-image.h   |  4 ++
+ drivers/goodix53x5/goodix53x5-match.c   |  5 ++-
+ drivers/goodix53x5/goodix53x5-private.h |  3 +-
+ drivers/goodix53x5/goodix53x5-scan.c    | 19 +++++++-
+ drivers/goodix53x5/goodix53x5-session.c |  5 ++-
+ sigfm/sigfm.cpp                         | 22 +++++-----
+ 12 files changed, 153 insertions(+), 27 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 149044b..14591b0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,6 @@ results/
+ tools/
+ AGENTS.md
+ *.pkg.tar.zst
++
++# Local biometric enrollment data
++test-storage.variant
+diff --git a/README.md b/README.md
+index 91c1310..560ee59 100644
+--- a/README.md
++++ b/README.md
+@@ -17,11 +17,13 @@ lsusb | grep -E '27c6:(5335|5381|5385|5395)'
+ ### Experimental 27c6:5381 support
+ 
+ The `27c6:5381` uses the Milan F protocol variant, configuration table entry 0
+-and chip ID `0x002202a0`. Initialization, GTLS, FDT setup and an encrypted
+-108x88 reference capture have been validated on a Dell G5 15 5587. Enrollment
+-still needs broader testing, so the driver refuses full initialization unless
+-`GOODIX53X5_ALLOW_FULL_INIT=1` is present in the `fprintd` environment. If the
+-PSK also needs replacement, the separate
++and chip ID `0x002202a0`. Initialization, GTLS, FDT setup, encrypted capture,
++eight-stage enrollment and live verification have been validated on one Dell
++G5 15 5587. Its image stream needs a device-specific 2x2 deinterleave and
++fusion of two repeated 54x88 readings before feature extraction. Support still
++needs testing on more devices and fingers, so the driver refuses full
++initialization unless `GOODIX53X5_ALLOW_FULL_INIT=1` is present in the
++`fprintd` environment. If the PSK also needs replacement, the separate
+ `GOODIX53X5_ALLOW_PSK_WRITE=1` opt-in is required before the potentially
+ irreversible change needed for the GTLS handshake.
+ 
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+index 1e8317d..908e3c0 100644
+--- a/docs/27c6-5381-porting.md
++++ b/docs/27c6-5381-porting.md
+@@ -10,7 +10,9 @@ do not contain firmware, biometric data, or a device-specific PSK.
+ - USB data interface: 1
+ - Bulk endpoints: `0x03` OUT and `0x81` IN
+ - Maximum bulk packet size: 64 bytes
+-- Firmware: `GF5288_HTSEC_APP_10020`
++- Firmware observed across resets: `GF5288_HTSEC_APP_10020` and
++  `GF3208_HTSEC_APP_10020`; both exact strings are present in Dell's PID5381
++  module
+ - Chip ID: `0x002202a0`
+ - OTP reply length: 32 bytes
+ 
+@@ -51,7 +53,31 @@ No firmware write was performed.
+ 
+ With configuration entry 0 and the Milan F image request, the device completed
+ GTLS, configuration upload, FDT calibration and a full encrypted reference
+-capture. The capture passed both the encrypted-payload HMAC and the GEA image
+-CRC. The enrollment state machine then armed FDT and waited for a finger. The
+-interactive test was cancelled after no finger was presented, so finger-image
+-quality, feature extraction and an eight-stage enrollment remain to be tested.
++capture. Reference and live captures passed both the encrypted-payload HMAC and
++the GEA image CRC. After the four CRC bytes are removed, the decrypted image is
++exactly 14,256 bytes: 9,504 packed 12-bit samples with no additional image
++header.
++
++Live captures established that each four-sample group represents a 2x2 spatial
++block. For a group `q0..q3`, the output positions are top-left `q0`, top-right
++`q3`, bottom-left `q1` and bottom-right `q2`. The resulting 108x88 image holds
++two adjacent readings of the same 54x88 sensor area. The 5381 path averages
++those readings and expands the result horizontally to preserve the dimensions
++expected by the feature extractor. Enrollment also retains the initial
++no-finger reference because this device reports finger-up before a finger has
++necessarily left the sensing area.
++
++An eight-stage enrollment completed with 173 to 228 SIGFM keypoints per sample.
++All 28 enrollment-sample pairs exceeded the matching threshold of 150; the
++minimum score was 240. A subsequent live verification matched with a best score
++of 778. A first verification attempt scored 40, showing that finger placement
++is still sensitive. These results validate the full path on one reader and one
++finger, but do not establish false-accept behavior or accuracy across devices.
++
++The SIGFM angle checks also clamp floating-point dot/cross ratios before inverse
++trigonometric operations and compare relative angles with an absolute 0.10-rad
++tolerance. These fixes follow the LGPL-licensed corrections in the
++[`goodix-27c6-55a4-fingerprint-linux`](https://github.com/Hydrogell/goodix-27c6-55a4-fingerprint-linux)
++implementation.
++
++No raw biometric image or enrollment template is stored in this repository.
+diff --git a/drivers/goodix53x5/goodix53x5-auth.c b/drivers/goodix53x5/goodix53x5-auth.c
+index 0bbe3a4..9198d5c 100644
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -188,6 +188,7 @@ goodix_verify_ssm_handler (FpiSsm   *ssm,
+         /* Extract SIFT features once for both identify and verify paths */
+         probe_info = goodix_match_extract (self->captured_image);
+         keypoints = goodix_match_keypoints_count (probe_info);
++        fp_dbg ("Verification capture extracted %d SIGFM keypoints", keypoints);
+ 
+         if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
+           {
+diff --git a/drivers/goodix53x5/goodix53x5-enroll.c b/drivers/goodix53x5/goodix53x5-enroll.c
+index e26abe2..5765c79 100644
+--- a/drivers/goodix53x5/goodix53x5-enroll.c
++++ b/drivers/goodix53x5/goodix53x5-enroll.c
+@@ -76,7 +76,14 @@ goodix_enroll_ssm_handler (FpiSsm   *ssm,
+           return;
+         }
+ 
+-      goodix_scan_start_ref_capture_subsm (ssm, dev);
++      /* Keep the initial no-finger frame for the whole enrollment.  Milan F
++       * can report FDT-up before the finger has physically cleared the glass;
++       * taking a new reference after every stage would then subtract part of
++       * the fingerprint from the next capture. */
++      if (self->reference_image == NULL)
++        goodix_scan_start_ref_capture_subsm (ssm, dev);
++      else
++        fpi_ssm_next_state (ssm);
+       break;
+ 
+     case GOODIX_ENROLL_WAIT_FINGER:
+@@ -112,6 +119,8 @@ goodix_enroll_ssm_handler (FpiSsm   *ssm,
+ 
+         info = goodix_match_extract (self->captured_image);
+         keypoints = goodix_match_keypoints_count (info);
++        fp_dbg ("Enrollment stage %d extracted %d SIGFM keypoints",
++                self->enroll_stage + 1, keypoints);
+ 
+         if (keypoints < GOODIX_MIN_CAPTURE_KEYPOINTS)
+           {
+@@ -227,6 +236,7 @@ goodix_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+   g_object_set (G_OBJECT (print), "fpi-data", data, NULL);
+ 
+   g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
++  g_clear_pointer (&self->reference_image, g_free);
+ 
+   fp_info ("Enrollment complete with %d samples", GOODIX_ENROLL_SAMPLES);
+ 
+diff --git a/drivers/goodix53x5/goodix53x5-image.c b/drivers/goodix53x5/goodix53x5-image.c
+index a47971a..17f28c5 100644
+--- a/drivers/goodix53x5/goodix53x5-image.c
++++ b/drivers/goodix53x5/goodix53x5-image.c
+@@ -64,6 +64,64 @@ goodix_device_decode_image (const guint8 *data,
+   return image;
+ }
+ 
++/**
++ * goodix_device_deinterleave_milan_f_5381:
++ *
++ * Milan F emits each four-sample unit as a 2x2 sensor block.  The packed
++ * values are ordered TL, BL, BR, TR; the generic 53x5 decoder historically
++ * treated all four as consecutive horizontal pixels.  Put the samples back
++ * into their spatial positions in-place.
++ */
++void
++goodix_device_deinterleave_milan_f_5381 (guint16 *image)
++{
++  g_autofree guint16 *linear = g_memdup2 (image,
++                                           GOODIX_SENSOR_PIXELS * sizeof (*image));
++  const gsize blocks_per_row = GOODIX_SENSOR_WIDTH / 2;
++
++  for (gsize block = 0; block < GOODIX_SENSOR_PIXELS / 4; block++)
++    {
++      gsize block_y = block / blocks_per_row;
++      gsize block_x = block % blocks_per_row;
++      gsize top = (block_y * 2) * GOODIX_SENSOR_WIDTH + block_x * 2;
++      gsize bottom = top + GOODIX_SENSOR_WIDTH;
++
++      image[top] = linear[block * 4];
++      image[top + 1] = linear[block * 4 + 3];
++      image[bottom] = linear[block * 4 + 1];
++      image[bottom + 1] = linear[block * 4 + 2];
++    }
++}
++
++/**
++ * goodix_device_canonicalize_milan_f_5381:
++ *
++ * A Milan F frame contains two adjacent 54x88 readings of the same sensing
++ * area.  Leaving both copies in the image gives SIFT duplicate descriptors;
++ * mutual matching can then pair equivalent points with opposite copies and
++ * reject the otherwise consistent geometry.  Average the copies and expand
++ * the canonical 54x88 reading horizontally to the driver's 108x88 image.
++ */
++void
++goodix_device_canonicalize_milan_f_5381 (guint8 *image)
++{
++  guint8 row[GOODIX_SENSOR_WIDTH / 2];
++
++  for (gsize y = 0; y < GOODIX_SENSOR_HEIGHT; y++)
++    {
++      guint8 *src = image + y * GOODIX_SENSOR_WIDTH;
++
++      for (gsize x = 0; x < GOODIX_SENSOR_WIDTH / 2; x++)
++        row[x] = ((guint16) src[x] + src[x + GOODIX_SENSOR_WIDTH / 2]) / 2;
++
++      for (gsize x = 0; x < GOODIX_SENSOR_WIDTH / 2; x++)
++        {
++          src[x * 2] = row[x];
++          src[x * 2 + 1] = row[x];
++        }
++    }
++}
++
+ static int
+ compare_double (const void *a,
+                 const void *b)
+diff --git a/drivers/goodix53x5/goodix53x5-image.h b/drivers/goodix53x5/goodix53x5-image.h
+index 8590985..bf3f7cc 100644
+--- a/drivers/goodix53x5/goodix53x5-image.h
++++ b/drivers/goodix53x5/goodix53x5-image.h
+@@ -24,6 +24,10 @@
+ guint16 *goodix_device_decode_image (const guint8 *data,
+                                      gsize         data_len);
+ 
++void     goodix_device_deinterleave_milan_f_5381 (guint16 *image);
++
++void     goodix_device_canonicalize_milan_f_5381 (guint8 *image);
++
+ guint8  *goodix_device_image_to_8bit (const guint16 *img12,
+                                       const guint16 *calib_img);
+ 
+diff --git a/drivers/goodix53x5/goodix53x5-match.c b/drivers/goodix53x5/goodix53x5-match.c
+index 41556ea..7e85f6e 100644
+--- a/drivers/goodix53x5/goodix53x5-match.c
++++ b/drivers/goodix53x5/goodix53x5-match.c
+@@ -31,7 +31,7 @@
+  * to compare against newly enrolled templates. */
+ #define GOODIX_SIGFM_TEMPLATE_MAGIC      "G53S"
+ #define GOODIX_SIGFM_TEMPLATE_MAGIC_LEN  4
+-#define GOODIX_SIGFM_TEMPLATE_VERSION    1
++#define GOODIX_SIGFM_TEMPLATE_VERSION    3
+ #define GOODIX_SIGFM_TEMPLATE_HEADER_LEN \
+   (GOODIX_SIGFM_TEMPLATE_MAGIC_LEN + sizeof (guint16))
+ #define GOODIX_SIGFM_TEMPLATE_MAX_LEN    (1024 * 1024)
+@@ -137,6 +137,9 @@ goodix_match_serialized_feature (GoodixMatchInfo *probe_info,
+   if (tmpl_info == NULL)
+     return status;
+ 
++  fp_dbg ("SIGFM keypoints: probe=%d template=%d",
++          sigfm_keypoints_count (probe_info),
++          sigfm_keypoints_count (tmpl_info));
+   *score = sigfm_match_score (probe_info, tmpl_info);
+   sigfm_free_info (tmpl_info);
+   if (*score < 0)
+diff --git a/drivers/goodix53x5/goodix53x5-private.h b/drivers/goodix53x5/goodix53x5-private.h
+index 780dcf8..39e785d 100644
+--- a/drivers/goodix53x5/goodix53x5-private.h
++++ b/drivers/goodix53x5/goodix53x5-private.h
+@@ -72,7 +72,8 @@
+ #define GOODIX53X5_FLAG_REQUIRE_PSK_WRITE_OPT_IN (1u << 0)
+ #define GOODIX53X5_FLAG_MILAN_F_5381              (1u << 1)
+ 
+-#define GOODIX5381_FIRMWARE "GF5288_HTSEC_APP_10020"
++#define GOODIX5381_FIRMWARE_5288 "GF5288_HTSEC_APP_10020"
++#define GOODIX5381_FIRMWARE_3208 "GF3208_HTSEC_APP_10020"
+ #define GOODIX5381_CHIP_ID  0x002202a0u
+ #define GOODIX5381_OTP_LEN  32u
+ 
+diff --git a/drivers/goodix53x5/goodix53x5-scan.c b/drivers/goodix53x5/goodix53x5-scan.c
+index d242b93..8b48606 100644
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -147,6 +147,8 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        fp_dbg ("Reference frame decrypted length: %zu", dec_len);
++
+         img12 = goodix_device_decode_image (decrypted, dec_len);
+         if (img12 == NULL)
+           {
+@@ -156,6 +158,10 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        if ((fpi_device_get_driver_data (dev) &
++             GOODIX53X5_FLAG_MILAN_F_5381) != 0)
++          goodix_device_deinterleave_milan_f_5381 (img12);
++
+         g_clear_pointer (&self->reference_image, g_free);
+         self->reference_image = g_steal_pointer (&img12);
+         fpi_ssm_mark_completed (ssm);
+@@ -326,6 +332,8 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        fp_dbg ("Capture frame decrypted length: %zu", dec_len);
++
+         /* Decode 12-bit and convert to 8-bit */
+         {
+           guint16 *img12 = goodix_device_decode_image (decrypted, dec_len);
+@@ -340,6 +348,10 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
+               return;
+             }
+ 
++          if ((fpi_device_get_driver_data (dev) &
++               GOODIX53X5_FLAG_MILAN_F_5381) != 0)
++            goodix_device_deinterleave_milan_f_5381 (img12);
++
+           if (self->reference_image == NULL)
+             {
+               g_free (img12);
+@@ -354,9 +366,14 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
+           self->captured_clipped_fraction =
+             goodix_device_image_clipped_fraction (img12);
+ 
++          if ((fpi_device_get_driver_data (dev) &
++               GOODIX53X5_FLAG_MILAN_F_5381) != 0)
++            goodix_device_canonicalize_milan_f_5381 (img8);
++
+           g_free (img12);
+           g_free (decrypted);
+-          g_clear_pointer (&self->reference_image, g_free);
++          if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
++            g_clear_pointer (&self->reference_image, g_free);
+ 
+           /* Store native 8-bit image for SIGFM matching */
+           g_free (self->captured_image);
+diff --git a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+index f9acbe0..77a44d4 100644
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -156,14 +156,15 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         fp_info ("Firmware version: %s", self->fw_version);
+ 
+         if (goodix_is_experimental_5381 (dev) &&
+-            g_strcmp0 (self->fw_version, GOODIX5381_FIRMWARE) != 0)
++            g_strcmp0 (self->fw_version, GOODIX5381_FIRMWARE_5288) != 0 &&
++            g_strcmp0 (self->fw_version, GOODIX5381_FIRMWARE_3208) != 0)
+           {
+             fpi_ssm_mark_failed (
+               ssm,
+               fpi_device_error_new_msg (
+                 FP_DEVICE_ERROR_NOT_SUPPORTED,
+                 "Unsupported 27c6:5381 firmware: %s (expected %s)",
+-                self->fw_version, GOODIX5381_FIRMWARE));
++                self->fw_version, GOODIX5381_FIRMWARE_5288));
+             return;
+           }
+ 
+diff --git a/sigfm/sigfm.cpp b/sigfm/sigfm.cpp
+index 7216bd9..e216d77 100644
+--- a/sigfm/sigfm.cpp
++++ b/sigfm/sigfm.cpp
+@@ -28,6 +28,7 @@
+ #include "opencv2/features2d.hpp"
+ #include "opencv2/imgcodecs.hpp"
+ #include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+@@ -99,7 +100,7 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
+ namespace {
+ constexpr auto distance_match = 0.85;
+ constexpr auto length_match = 0.05;
+-constexpr auto angle_match = 0.05;
++constexpr auto angle_tol_rad = 0.10;
+ constexpr auto min_match = 5;
+ constexpr auto sift_nfeatures = 0;
+ constexpr auto sift_octave_layers = 3;
+@@ -292,12 +293,15 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+                     length_match) {
+ 
+                     double product = length_1 * length_2;
++                    auto clamp1 = [](double value) {
++                        return std::clamp(value, -1.0, 1.0);
++                    };
+                     angles.emplace_back(angle(
+                         M_PI / 2 +
+-                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
+-                                 product),
+-                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
+-                             product),
++                            asin(clamp1((vec_1[0] * vec_2[0] +
++                                         vec_1[1] * vec_2[1]) / product)),
++                        acos(clamp1((vec_1[0] * vec_2[1] -
++                                     vec_1[1] * vec_2[0]) / product)),
+                         match_1, match_2));
+                 }
+             }
+@@ -313,12 +317,8 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+             for (std::size_t k = j + 1; k < angles.size(); k++) {
+                 angle angle_2 = angles[k];
+ 
+-                if (1 - std::min(angle_1.sin, angle_2.sin) /
+-                                std::max(angle_1.sin, angle_2.sin) <=
+-                        angle_match &&
+-                    1 - std::min(angle_1.cos, angle_2.cos) /
+-                                std::max(angle_1.cos, angle_2.cos) <=
+-                        angle_match) {
++                if (std::fabs(angle_1.sin - angle_2.sin) <= angle_tol_rad &&
++                    std::fabs(angle_1.cos - angle_2.cos) <= angle_tol_rad) {
+ 
+                     count += 1;
+                 }
+-- 
+2.55.0
+
+
+From dba33ba166952742f4cc2e3b1f86292912ceed22 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Tue, 8 Sep 2026 10:21:37 +0200
+Subject: [PATCH 4/7] Document Goodix 5381 implementation and setup
+
+---
+ docs/trabajo-realizado-27c6-5381.md | 274 ++++++++++++++++++++++++++++
+ 1 file changed, 274 insertions(+)
+ create mode 100644 docs/trabajo-realizado-27c6-5381.md
+
+diff --git a/docs/trabajo-realizado-27c6-5381.md b/docs/trabajo-realizado-27c6-5381.md
+new file mode 100644
+index 0000000..61fb8ae
+--- /dev/null
++++ b/docs/trabajo-realizado-27c6-5381.md
+@@ -0,0 +1,274 @@
++# Trabajo realizado para habilitar el lector Goodix 27c6:5381
++
++## Resultado actual
++
++El lector de huellas del Dell G5 15 5587 ya es reconocido por `fprintd` como:
++
++```text
++Goodix HTK32 Fingerprint Sensor
++```
++
++El sistema tiene registrado el índice derecho del usuario `aitor`. El comando
++`fprintd-list aitor` encuentra un dispositivo y muestra
++`right-index-finger` como huella registrada.
++
++El soporte sigue marcado como experimental porque solo se ha probado en una
++unidad física y con un dedo. La colocación del dedo influye bastante en el
++resultado.
++
++## 1. Diagnóstico inicial
++
++El mensaje original era:
++
++```text
++Impossible to enroll:
++GDBus.Error:net.reactivated.Fprint.Error.NoSuchDevice:
++No devices available
++```
++
++Se comprobó que el lector USB es un Goodix con identificador `27c6:5381`. La
++versión normal de `libfprint` instalada en Arch Linux no incluía un controlador
++compatible, por lo que `fprintd` no podía enumerarlo.
++
++Datos confirmados en este equipo:
++
++- Equipo: Dell G5 15 5587.
++- USB VID:PID: `27c6:5381`.
++- Interfaz USB de datos: `1`.
++- Endpoint de salida: `0x03`.
++- Endpoint de entrada: `0x81`.
++- Tamaño máximo de paquete: 64 bytes.
++- Chip ID: `0x002202a0`.
++- OTP: 32 bytes.
++- Firmware observado: `GF5288_HTSEC_APP_10020` y
++  `GF3208_HTSEC_APP_10020`.
++
++## 2. Investigación del protocolo
++
++Se estudió el proyecto
++[`goodix53x5-libfprint`](https://github.com/AndyHazz/goodix53x5-libfprint), el
++controlador oficial de Dell para PID 5381 y el trabajo de referencia
++[`goodix-27c6-55a4-fingerprint-linux`](https://github.com/Hydrogell/goodix-27c6-55a4-fingerprint-linux).
++
++También se abrió el
++[`issue #29`](https://github.com/AndyHazz/goodix53x5-libfprint/issues/29) para
++documentar y proponer la incorporación del dispositivo al proyecto.
++
++El análisis mostró que este sensor usa la variante **Milan F**, diferente de la
++variante utilizada por otros lectores 53x5. Para el PID 5381 hacen falta:
++
++- La entrada 0 de la tabla de configuración del controlador de Dell.
++- Una orden de preparación de imagen de dos bytes: `01 00`.
++- Cálculos de calibración específicos a partir de la OTP.
++- Aceptar las dos cadenas de firmware observadas en el mismo dispositivo.
++- Procesar de forma especial la distribución espacial de la imagen.
++
++## 3. Cambio de la PSK
++
++El sensor utiliza una PSK persistente para establecer la sesión cifrada GTLS.
++Con autorización expresa, la PSK propia del equipo se sustituyó por la PSK
++conocida formada por ceros que usa este controlador experimental.
++
++Después de escribirla se volvió a leer su hash y se comprobó que coincidía
++antes de iniciar GTLS. El cambio permanece guardado en el lector y puede afectar
++a la compatibilidad posterior con el controlador de Windows.
++
++No se escribió ni modificó el firmware del lector.
++
++El código mantiene dos protecciones independientes:
++
++- `GOODIX53X5_ALLOW_FULL_INIT=1` permite inicializar completamente el 5381.
++- `GOODIX53X5_ALLOW_PSK_WRITE=1` permite escribir la PSK cuando sea necesario.
++
++La segunda variable no está configurada en el servicio actual, porque la PSK ya
++se cambió y no debe volver a escribirse en cada arranque.
++
++## 4. Código desarrollado
++
++El trabajo se realizó en la rama Git `experimental-27c6-5381` del repositorio:
++
++```text
++/home/aitor/goodix53x5-libfprint
++```
++
++Los tres commits principales son:
++
++```text
++be924b8 Add guarded experimental support for Goodix 5381
++1fd1a0b Use Milan F protocol for Goodix 5381
++5566213 Complete image processing for Goodix 5381
++```
++
++### Detección e inicialización
++
++Se añadió `27c6:5381` a la tabla de dispositivos y se implementaron
++comprobaciones para el chip ID, la longitud de la OTP y las dos versiones de
++firmware conocidas. El controlador puede hacer ping, reset, consulta de
++firmware, consulta del chip, lectura de OTP, sesión GTLS, carga de configuración
++y calibración FDT.
++
++La inicialización completa permanece protegida por una variable de entorno para
++evitar cambios accidentales en unidades no verificadas.
++
++### Captura y reconstrucción de imagen
++
++Cada captura descifrada contiene exactamente 14.256 bytes después de retirar
++los cuatro bytes del CRC. Son 9.504 muestras de 12 bits, equivalentes a una
++imagen de 108 × 88 píxeles.
++
++Las muestras no llegan en orden lineal. Cada grupo de cuatro valores representa
++un bloque de 2 × 2 píxeles. Para `q0`, `q1`, `q2` y `q3`, la colocación correcta
++es:
++
++```text
++q0 q3
++q1 q2
++```
++
++Se añadió una función que reconstruye esa distribución. Después de hacerlo se
++descubrió que la imagen contiene dos lecturas contiguas de 54 × 88 del mismo
++área física. Ambas mitades se promedian y el resultado se amplía horizontalmente
++a 108 × 88 para mantener el tamaño esperado por SIGFM.
++
++Este tratamiento evita descriptores SIFT duplicados que antes confundían la
++comparación geométrica.
++
++### Referencia sin dedo
++
++El sensor puede informar de que el dedo se ha retirado antes de que haya salido
++físicamente del área de lectura. Si se tomaba una nueva referencia tras cada
++etapa, parte de la huella acababa incluida en la referencia siguiente.
++
++Durante el enrolamiento ahora se captura una sola referencia sin dedo al inicio
++y se conserva durante las ocho muestras.
++
++### Correcciones en SIGFM
++
++Se corrigieron dos problemas numéricos del comparador:
++
++- Los cocientes usados por `asin` y `acos` se limitan al intervalo `[-1, 1]`.
++- Los ángulos relativos se comparan mediante una tolerancia absoluta de 0,10
++  radianes.
++
++Estas correcciones siguen las aplicadas en el proyecto LGPL de referencia para
++el Goodix 55a4. La versión interna del formato de plantilla SIGFM se elevó a 3
++para impedir que plantillas creadas con un procesamiento anterior se mezclen
++con las nuevas.
++
++## 5. Pruebas realizadas
++
++Las capturas cifradas superaron estas comprobaciones:
++
++- HMAC del contenido cifrado.
++- CRC de la imagen GEA.
++- Descifrado completo de la imagen.
++- Reconstrucción y normalización de la captura.
++- Extracción de características SIGFM/SIFT.
++
++El enrolamiento experimental completó sus ocho etapas. Las muestras contenían
++entre 173 y 228 puntos característicos. Las 28 comparaciones posibles entre las
++ocho muestras superaron el umbral 150; la puntuación mínima fue 240.
++
++En una verificación independiente se obtuvo `MATCH` con una puntuación de 778.
++Una lectura anterior obtuvo 40 y no coincidió, lo que confirma la sensibilidad
++a la posición del dedo.
++
++También se ejecutó `scripts/run-tests.sh`. Pasaron las pruebas de criptografía,
++extracción SIGFM y comparación SIGFM. La biblioteca completa se compiló
++correctamente. Las pruebas normales de Meson pasaron salvo el validador de
++metadatos, que no pudo consultar `fprint.freedesktop.org` por falta de acceso
++DNS durante la ejecución; no era un fallo del controlador.
++
++## 6. Instalación activa en el sistema
++
++La biblioteca experimental se instaló de forma aislada en:
++
++```text
++/opt/libfprint-goodix53x5/lib/libfprint-2.so.2.0.0
++```
++
++SHA-256 de la biblioteca instalada:
++
++```text
++2f5f91a01637cd4e1048f814dca728580f588a9d35ae09777b217b67ed2862db
++```
++
++No se reemplazó `/usr/lib/libfprint-2.so.2`, que continúa perteneciendo al
++paquete de Arch. Solo `fprintd` carga la biblioteca experimental mediante este
++archivo de systemd:
++
++```text
++/etc/systemd/system/fprintd.service.d/goodix53x5.conf
++```
++
++Su contenido es:
++
++```ini
++[Service]
++Environment=LD_LIBRARY_PATH=/opt/libfprint-goodix53x5/lib
++Environment=GOODIX53X5_ALLOW_FULL_INIT=1
++```
++
++Después se ejecutaron `systemctl daemon-reload` y
++`systemctl restart fprintd.service`. La configuración persiste tras reiniciar el
++equipo.
++
++El enrolamiento real mediante `fprintd-enroll` completó ocho etapas y terminó
++con `enroll-completed`. La huella quedó en el almacén administrado por
++`fprintd`, bajo `/var/lib/fprint`.
++
++## 7. Cómo comprobarlo
++
++Mostrar el lector y las huellas registradas:
++
++```bash
++sudo fprintd-list aitor
++```
++
++Probar el índice derecho:
++
++```bash
++sudo fprintd-verify aitor
++```
++
++Tras `Verify started!`, hay que colocar el índice derecho centrado y cubrir la
++mayor parte posible del sensor. Una coincidencia correcta aparece como:
++
++```text
++Verify result: verify-match (done)
++```
++
++Consultar el estado del servicio:
++
++```bash
++sudo systemctl status fprintd
++```
++
++## 8. Cómo revertir la instalación experimental
++
++Estos comandos eliminan el override y la biblioteca aislada, y hacen que
++`fprintd` vuelva a utilizar la versión de `libfprint` instalada por Arch:
++
++```bash
++sudo rm /etc/systemd/system/fprintd.service.d/goodix53x5.conf
++sudo rm -rf /opt/libfprint-goodix53x5
++sudo systemctl daemon-reload
++sudo systemctl restart fprintd
++```
++
++La PSK escrita en el lector es persistente y estos comandos no restauran la PSK
++original.
++
++Para borrar la huella registrada del usuario:
++
++```bash
++sudo fprintd-delete aitor
++```
++
++## 9. Privacidad de los datos de prueba
++
++Las imágenes y plantillas temporales utilizadas para estudiar el formato se
++eliminaron. `test-storage.variant` se añadió a `.gitignore` para impedir su
++inclusión accidental. No se guardaron capturas biométricas ni plantillas en los
++commits del repositorio.
++
+-- 
+2.55.0
+
+
+From 9b042bde94e8b668ec140367f04b7639ee97dc8c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Tue, 8 Sep 2026 16:47:24 +0200
+Subject: [PATCH 5/7] Tolerate 5381 open-time FDT noise
+
+---
+ docs/27c6-5381-porting.md               |  6 +++++
+ drivers/goodix53x5/goodix53x5-fdt.h     | 26 ++++++++++++++++++
+ drivers/goodix53x5/goodix53x5-session.c | 10 ++++++-
+ scripts/run-tests.sh                    |  5 ++++
+ tests/test_goodix53x5_fdt.c             | 35 +++++++++++++++++++++++++
+ 5 files changed, 81 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/goodix53x5/goodix53x5-fdt.h
+ create mode 100644 tests/test_goodix53x5_fdt.c
+
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+index 908e3c0..e897183 100644
+--- a/docs/27c6-5381-porting.md
++++ b/docs/27c6-5381-porting.md
+@@ -20,6 +20,12 @@ The interface, endpoints, packet size and wrapless protocol match the existing
+ 53x5 driver. Ping, firmware query, reset, chip-ID query, OTP read and PSK-hash
+ read all complete successfully.
+ 
++The fallback OTP fields yield `delta_fdt = 0`. That value is retained for
++finger-event validation, but open-time baseline stabilization uses a minimum
++tolerance of 3. Three is the smallest value produced by the normal OTP formula;
++without this open-only floor, ordinary sensor noise made consecutive baseline
++reads require bit-for-bit equality and caused intermittent device-open failures.
++
+ ## Calibration evidence
+ 
+ Dell publishes Goodix driver `KP8ND`, version `3.31.30.110 A08`, for the Dell G5
+diff --git a/drivers/goodix53x5/goodix53x5-fdt.h b/drivers/goodix53x5/goodix53x5-fdt.h
+new file mode 100644
+index 0000000..6edff60
+--- /dev/null
++++ b/drivers/goodix53x5/goodix53x5-fdt.h
+@@ -0,0 +1,26 @@
++/*
++ * Goodix 53x5 driver for libfprint — FDT policy helpers
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#pragma once
++
++#include <glib.h>
++
++/* The 5381 OTP fallback reports delta_fdt == 0. Requiring two open-time
++ * baseline reads to be bit-for-bit identical makes device opening depend on
++ * normal sensor noise. Three is the smallest tolerance produced by the
++ * non-fallback OTP formula (diff == 1), so use it only for open-time
++ * stabilization. Finger-down/up detection keeps the original OTP value. */
++#define GOODIX5381_OPEN_FDT_MIN_DELTA 3u
++
++static inline guint16
++goodix_open_fdt_tolerance (gboolean experimental_5381,
++                           guint16  otp_delta)
++{
++  if (experimental_5381 && otp_delta < GOODIX5381_OPEN_FDT_MIN_DELTA)
++    return GOODIX5381_OPEN_FDT_MIN_DELTA;
++
++  return otp_delta;
++}
+diff --git a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+index 77a44d4..66116c6 100644
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -24,6 +24,7 @@
+ #include "goodix53x5-transport.h"
+ #include "goodix53x5-commands.h"
+ #include "goodix53x5-calibration.h"
++#include "goodix53x5-fdt.h"
+ #include "goodix53x5-session.h"
+ 
+ #include <string.h>
+@@ -586,6 +587,7 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         g_autoptr(GError) error = NULL;
+         const guint8 *pl;
+         gsize pl_len;
++        guint16 open_fdt_delta;
+ 
+         if (!goodix_cmd_parse_fdt_manual_reply (dev, &pl, &pl_len, &error))
+           {
+@@ -593,11 +595,17 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+             return;
+           }
+ 
++        /* The 5381 fallback OTP contains a zero FDT delta. Keep that value for
++         * actual touch detection, but allow the smallest normal OTP-derived
++         * tolerance while measuring the open-time no-finger baseline. */
++        open_fdt_delta = goodix_open_fdt_tolerance (
++            goodix_is_experimental_5381 (dev), self->calib.delta_fdt);
++
+         /* Validate against the open-time FDT base we just recorded. */
+         if (!goodix_device_is_fdt_base_valid (pl + 4,
+                                               self->fdt_data_tx_on,
+                                               GOODIX_FDT_BASE_LEN,
+-                                              self->calib.delta_fdt))
++                                              open_fdt_delta))
+           {
+             if (self->open_fdt_retries++ < GOODIX_OPEN_FDT_MAX_RETRIES)
+               {
+diff --git a/scripts/run-tests.sh b/scripts/run-tests.sh
+index 86eabf0..f786e39 100755
+--- a/scripts/run-tests.sh
++++ b/scripts/run-tests.sh
+@@ -40,6 +40,11 @@ gcc -std=gnu99 -Wall -o "$out_dir/test_goodix53x5_crypto" \
+   -Itests/shim -Idrivers/goodix53x5 $glib_flags -lcrypto
+ run_test "goodix53x5 crypto" "$out_dir/test_goodix53x5_crypto"
+ 
++gcc -std=gnu99 -Wall -o "$out_dir/test_goodix53x5_fdt" \
++  tests/test_goodix53x5_fdt.c -Idrivers/goodix53x5 \
++  $glib_flags
++run_test "goodix53x5 FDT policy" "$out_dir/test_goodix53x5_fdt"
++
+ g++ -std=c++17 -o "$out_dir/test_sigfm_extract" \
+   tests/test_sigfm_extract.cpp sigfm/sigfm.cpp \
+   $opencv_cflags "${opencv_libs[@]}"
+diff --git a/tests/test_goodix53x5_fdt.c b/tests/test_goodix53x5_fdt.c
+new file mode 100644
+index 0000000..ab380d2
+--- /dev/null
++++ b/tests/test_goodix53x5_fdt.c
+@@ -0,0 +1,35 @@
++/* Host-side tests for open-time FDT tolerance selection. */
++
++#include "goodix53x5-fdt.h"
++
++#include <stdio.h>
++
++static int failures;
++
++#define CHECK(cond, msg)                                                       \
++  do {                                                                         \
++      if (!(cond))                                                             \
++        {                                                                      \
++          printf ("  FAIL: %s\n", msg);                                       \
++          failures++;                                                          \
++        }                                                                      \
++      else                                                                     \
++        printf ("  ok:   %s\n", msg);                                         \
++  } while (0)
++
++int
++main (void)
++{
++  CHECK (goodix_open_fdt_tolerance (TRUE, 0) ==
++         GOODIX5381_OPEN_FDT_MIN_DELTA,
++         "5381 fallback gets a nonzero open-time tolerance");
++  CHECK (goodix_open_fdt_tolerance (TRUE, 2) ==
++         GOODIX5381_OPEN_FDT_MIN_DELTA,
++         "5381 values below the minimum are raised");
++  CHECK (goodix_open_fdt_tolerance (TRUE, 7) == 7,
++         "5381 values above the minimum remain unchanged");
++  CHECK (goodix_open_fdt_tolerance (FALSE, 0) == 0,
++         "other devices keep their OTP tolerance");
++
++  return failures != 0;
++}
+-- 
+2.55.0
+
+
+From a2562ff157c3ed023d7cb213286282dc63651da2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Tue, 8 Sep 2026 17:11:10 +0200
+Subject: [PATCH 6/7] Let 5381 FDT baseline settle between retries
+
+---
+ docs/27c6-5381-porting.md               |  4 ++++
+ drivers/goodix53x5/goodix53x5-fdt.h     | 24 ++++++++++++++++++++++++
+ drivers/goodix53x5/goodix53x5-session.c | 25 ++++++++++++++++++++-----
+ tests/test_goodix53x5_fdt.c             |  5 +++++
+ 4 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+index e897183..e2b3621 100644
+--- a/docs/27c6-5381-porting.md
++++ b/docs/27c6-5381-porting.md
+@@ -25,6 +25,10 @@ finger-event validation, but open-time baseline stabilization uses a minimum
+ tolerance of 3. Three is the smallest value produced by the normal OTP formula;
+ without this open-only floor, ordinary sensor noise made consecutive baseline
+ reads require bit-for-bit equality and caused intermittent device-open failures.
++The 5381 open path also spaces retries by 100 ms and permits up to ten retries,
++because back-to-back reads immediately after enrollment were only about 10 ms
++apart and repeatedly sampled the same unsettled state. Failures report the
++observed maximum delta without logging raw FDT or biometric data.
+ 
+ ## Calibration evidence
+ 
+diff --git a/drivers/goodix53x5/goodix53x5-fdt.h b/drivers/goodix53x5/goodix53x5-fdt.h
+index 6edff60..833de4f 100644
+--- a/drivers/goodix53x5/goodix53x5-fdt.h
++++ b/drivers/goodix53x5/goodix53x5-fdt.h
+@@ -14,6 +14,8 @@
+  * non-fallback OTP formula (diff == 1), so use it only for open-time
+  * stabilization. Finger-down/up detection keeps the original OTP value. */
+ #define GOODIX5381_OPEN_FDT_MIN_DELTA 3u
++#define GOODIX5381_OPEN_FDT_MAX_RETRIES 10u
++#define GOODIX5381_OPEN_FDT_RETRY_DELAY_MS 100u
+ 
+ static inline guint16
+ goodix_open_fdt_tolerance (gboolean experimental_5381,
+@@ -24,3 +26,25 @@ goodix_open_fdt_tolerance (gboolean experimental_5381,
+ 
+   return otp_delta;
+ }
++
++static inline guint16
++goodix_fdt_max_delta (const guint8 *data1,
++                      const guint8 *data2,
++                      gsize         len)
++{
++  guint16 max_delta = 0;
++
++  for (gsize i = 0; i < len; i += 2)
++    {
++      guint16 val1 = data1[i] | ((guint16) data1[i + 1] << 8);
++      guint16 val2 = data2[i] | ((guint16) data2[i + 1] << 8);
++      guint16 shifted1 = val1 >> 1;
++      guint16 shifted2 = val2 >> 1;
++      guint16 delta = shifted1 > shifted2 ? shifted1 - shifted2 :
++                                            shifted2 - shifted1;
++
++      max_delta = MAX (max_delta, delta);
++    }
++
++  return max_delta;
++}
+diff --git a/drivers/goodix53x5/goodix53x5-session.c b/drivers/goodix53x5/goodix53x5-session.c
+index 66116c6..6ab8d3a 100644
+--- a/drivers/goodix53x5/goodix53x5-session.c
++++ b/drivers/goodix53x5/goodix53x5-session.c
+@@ -588,6 +588,10 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         const guint8 *pl;
+         gsize pl_len;
+         guint16 open_fdt_delta;
++        guint16 observed_fdt_delta;
++        gboolean experimental_5381;
++        guint max_retries;
++        guint retry_delay_ms;
+ 
+         if (!goodix_cmd_parse_fdt_manual_reply (dev, &pl, &pl_len, &error))
+           {
+@@ -598,8 +602,15 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+         /* The 5381 fallback OTP contains a zero FDT delta. Keep that value for
+          * actual touch detection, but allow the smallest normal OTP-derived
+          * tolerance while measuring the open-time no-finger baseline. */
++        experimental_5381 = goodix_is_experimental_5381 (dev);
+         open_fdt_delta = goodix_open_fdt_tolerance (
+-            goodix_is_experimental_5381 (dev), self->calib.delta_fdt);
++            experimental_5381, self->calib.delta_fdt);
++        observed_fdt_delta = goodix_fdt_max_delta (
++            pl + 4, self->fdt_data_tx_on, GOODIX_FDT_BASE_LEN);
++        max_retries = experimental_5381 ?
++            GOODIX5381_OPEN_FDT_MAX_RETRIES : GOODIX_OPEN_FDT_MAX_RETRIES;
++        retry_delay_ms = experimental_5381 ?
++            GOODIX5381_OPEN_FDT_RETRY_DELAY_MS : 0;
+ 
+         /* Validate against the open-time FDT base we just recorded. */
+         if (!goodix_device_is_fdt_base_valid (pl + 4,
+@@ -607,15 +618,19 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
+                                               GOODIX_FDT_BASE_LEN,
+                                               open_fdt_delta))
+           {
+-            if (self->open_fdt_retries++ < GOODIX_OPEN_FDT_MAX_RETRIES)
++            if (self->open_fdt_retries++ < max_retries)
+               {
+-                fp_warn ("Open FDT validation unstable, retrying (%u/%u)",
++                fp_warn ("Open FDT validation unstable: observed delta %u, "
++                         "limit %u; retrying (%u/%u) after %ums",
++                         observed_fdt_delta, open_fdt_delta,
+                          self->open_fdt_retries,
+-                         GOODIX_OPEN_FDT_MAX_RETRIES);
++                         max_retries, retry_delay_ms);
+                 g_free (self->fdt_data_tx_on);
+                 self->fdt_data_tx_on = g_memdup2 (pl + 4,
+                                                   GOODIX_FDT_BASE_LEN);
+-                fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_FDT_TX_ON_2);
++                fpi_ssm_jump_to_state_delayed (ssm,
++                                               GOODIX_OPEN_FDT_TX_ON_2,
++                                               retry_delay_ms);
+                 return;
+               }
+ 
+diff --git a/tests/test_goodix53x5_fdt.c b/tests/test_goodix53x5_fdt.c
+index ab380d2..87ea9bc 100644
+--- a/tests/test_goodix53x5_fdt.c
++++ b/tests/test_goodix53x5_fdt.c
+@@ -20,6 +20,9 @@ static int failures;
+ int
+ main (void)
+ {
++  guint8 baseline[4] = { 0x00, 0x02, 0x00, 0x04 };
++  guint8 noisy[4] = { 0x06, 0x02, 0x0a, 0x04 };
++
+   CHECK (goodix_open_fdt_tolerance (TRUE, 0) ==
+          GOODIX5381_OPEN_FDT_MIN_DELTA,
+          "5381 fallback gets a nonzero open-time tolerance");
+@@ -30,6 +33,8 @@ main (void)
+          "5381 values above the minimum remain unchanged");
+   CHECK (goodix_open_fdt_tolerance (FALSE, 0) == 0,
+          "other devices keep their OTP tolerance");
++  CHECK (goodix_fdt_max_delta (baseline, noisy, sizeof (baseline)) == 5,
++         "maximum FDT delta is reported in shifted sensor units");
+ 
+   return failures != 0;
+ }
+-- 
+2.55.0
+
+
+From 4a9be69b922025947e1fa7c16c68220202f3b325 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aitor=20Calero=20Garc=C3=ADa?= <aitor.calero@gmail.com>
+Date: Wed, 9 Sep 2026 09:39:38 +0200
+Subject: [PATCH 7/7] Preserve 5381 enrollment reference and document
+ experimental limits
+
+---
+ README.md                              | 14 ++++--
+ docs/27c6-5381-porting.md              | 47 +++++++++++++++++++-
+ docs/5381-milan-contribution.md        | 60 ++++++++++++++++++++++++++
+ docs/trabajo-realizado-27c6-5381.md    | 11 ++++-
+ drivers/goodix53x5/goodix53x5-auth.c   |  6 ++-
+ drivers/goodix53x5/goodix53x5-enroll.c | 10 ++++-
+ drivers/goodix53x5/goodix53x5-scan.c   |  6 ++-
+ 7 files changed, 144 insertions(+), 10 deletions(-)
+ create mode 100644 docs/5381-milan-contribution.md
+
+diff --git a/README.md b/README.md
+index 560ee59..6f5d69f 100644
+--- a/README.md
++++ b/README.md
+@@ -16,11 +16,19 @@ lsusb | grep -E '27c6:(5335|5381|5385|5395)'
+ 
+ ### Experimental 27c6:5381 support
+ 
++This branch is an **experimental SIGFM prototype based on AndyHazz's driver**,
++not a port to seaweeduk's native Milan stack. Successful enrollments and matches
++have been observed, but intermittent `verify-no-match` results remain, including
++after a service restart. Repeated recognition and unregistered-finger rejection
++are not yet validated. See the [Milan contribution assessment](docs/5381-milan-contribution.md)
++before proposing these commits for integration.
++
+ The `27c6:5381` uses the Milan F protocol variant, configuration table entry 0
+ and chip ID `0x002202a0`. Initialization, GTLS, FDT setup, encrypted capture,
+-eight-stage enrollment and live verification have been validated on one Dell
+-G5 15 5587. Its image stream needs a device-specific 2x2 deinterleave and
+-fusion of two repeated 54x88 readings before feature extraction. Support still
++eight-stage enrollment and live verification have succeeded on one Dell
++G5 15 5587. The prototype applies a device-specific 2x2 deinterleave and
++fusion of two 54x88 halves before feature extraction; this reconstruction has
++not been established as native-driver parity. Support still
+ needs testing on more devices and fingers, so the driver refuses full
+ initialization unless `GOODIX53X5_ALLOW_FULL_INIT=1` is present in the
+ `fprintd` environment. If the PSK also needs replacement, the separate
+diff --git a/docs/27c6-5381-porting.md b/docs/27c6-5381-porting.md
+index e2b3621..874929a 100644
+--- a/docs/27c6-5381-porting.md
++++ b/docs/27c6-5381-porting.md
+@@ -68,15 +68,19 @@ the GEA image CRC. After the four CRC bytes are removed, the decrypted image is
+ exactly 14,256 bytes: 9,504 packed 12-bit samples with no additional image
+ header.
+ 
+-Live captures established that each four-sample group represents a 2x2 spatial
++The prototype interprets each four-sample group as a 2x2 spatial
+ block. For a group `q0..q3`, the output positions are top-left `q0`, top-right
+ `q3`, bottom-left `q1` and bottom-right `q2`. The resulting 108x88 image holds
+-two adjacent readings of the same 54x88 sensor area. The 5381 path averages
++two adjacent halves interpreted as readings of the same 54x88 sensor area. The 5381 path averages
+ those readings and expands the result horizontally to preserve the dimensions
+ expected by the feature extractor. Enrollment also retains the initial
+ no-finger reference because this device reports finger-up before a finger has
+ necessarily left the sensing area.
+ 
++This image-layout interpretation remains a prototype assumption, not confirmed
++native parity. HMAC and CRC success establish payload integrity, not the spatial
++interpretation or correctness of the final image-processing algorithm.
++
+ An eight-stage enrollment completed with 173 to 228 SIGFM keypoints per sample.
+ All 28 enrollment-sample pairs exceeded the matching threshold of 150; the
+ minimum score was 240. A subsequent live verification matched with a best score
+@@ -84,6 +88,45 @@ of 778. A first verification attempt scored 40, showing that finger placement
+ is still sensitive. These results validate the full path on one reader and one
+ finger, but do not establish false-accept behavior or accuracy across devices.
+ 
++### Reference continuity across fprintd's duplicate check
++
++Subsequent testing exposed an enrollment lifecycle bug. fprintd performs an
++IDENTIFY duplicate check before starting ENROLL, advertising nine stages for
++this eight-sample driver. The 5381 can report finger-up while the finger is
++still touching the glass. Capturing a new reference at ENROLL start therefore
++can incorporate that finger into the reference used for all eight samples.
++
++Two fresh verification captures scored 29,974 against each other with the
++existing preprocessing, while scoring only 72 and 35 against the old enrolled
++print. Only 10 of the old enrollment's 28 sample-pair comparisons reached the
++150 gate. These measurements narrowed the failure to the enrollment path;
++they did not justify changing the matching threshold or image geometry.
++
++For the 5381 only, a successful IDENTIFY now retains its pre-touch reference
++for an immediately following ENROLL on the same open device. VERIFY, a new
++IDENTIFY, errors and device close discard the reference; enrollment also
++discards it if hardware reinitialization is required. Other USB IDs keep their
++existing behavior. A direct enrollment without a preceding duplicate check
++still captures its own initial reference.
++
++The corrected live enrollment logged reuse of the pre-touch reference, and
++the newly enrolled index finger subsequently verified successfully. Prints
++enrolled with a contaminated reference need re-enrollment. Temporary diagnostic
++variants were evaluated in memory, without storing raw images, and removed
++from the final implementation.
++
++A subsequent verification after restarting fprintd with the diagnostic-free
++build returned `verify-no-match`. The reference-lifecycle correction alone
++therefore does not yet establish reliable authentication. An unregistered-finger
++rejection test and repeated successful verifications remain to be confirmed.
++
++The driver host tests and libfprint's three core unit suites (device, SSM,
++assembling) passed. The optional metainfo validation failed because the upstream
++issue-tracker URL was unreachable; the other driver replay tests were skipped
++in this build without introspection. The installed library was checked against
++the final build by SHA-256, and the temporary diagnostic service override was
++removed.
++
+ The SIGFM angle checks also clamp floating-point dot/cross ratios before inverse
+ trigonometric operations and compare relative angles with an absolute 0.10-rad
+ tolerance. These fixes follow the LGPL-licensed corrections in the
+diff --git a/docs/5381-milan-contribution.md b/docs/5381-milan-contribution.md
+new file mode 100644
+index 0000000..e990c6c
+--- /dev/null
++++ b/docs/5381-milan-contribution.md
+@@ -0,0 +1,60 @@
++# Goodix 5381: experimental branch and Milan contribution assessment
++
++Assessment date: 2026-09-09.
++
++## Scope and evidence
++
++`experimental-27c6-5381` preserves the AndyHazz/SIGFM prototype and its commit
++history. It is shared for review and hardware/protocol observations, not as a
++merge-ready implementation for seaweeduk's native Milan stack.
++
++The latest correction keeps the pre-touch reference across fprintd's
++IDENTIFY-to-ENROLL duplicate check for the 5381. A corrected enrollment and
++successful verification were observed, but a later verification after restarting
++the diagnostic-free build returned `verify-no-match`. Repeated recognition,
++unregistered-finger rejection, cold-start and suspend/resume validation remain
++open. The matching threshold was not lowered to obtain a successful result.
++
++On 2026-09-09, `bash scripts/run-tests.sh` passed all four host test binaries:
++crypto, FDT policy, SIGFM extraction and SIGFM matching. These tests do not
++exercise physical sensor timing or establish authentication reliability. No
++new sensor operation or system installation was performed for publication.
++
++See [porting notes](27c6-5381-porting.md) for observations and earlier tests.
++Only source and documentation are included in this contribution; no fingerprint
++images, templates, device credentials or vendor binaries are added.
++
++## Reviewed upstream starting point
++
++- [Issue 205](https://github.com/seaweeduk/goodix53x5-libfprint/issues/205)
++- [`milan-dev` handoff at f8b912b](https://github.com/seaweeduk/goodix53x5-libfprint/blob/f8b912bbbe97c95a09c5a3c082380b26cf1d0c7b/PROFILE0-SUPPORT-SCOPE.md)
++
++That branch replaces SIGFM with native Milan processing and reorganizes the
++device code. Its profile-0 handoff describes distinct USB calibration,
++reference/capture, coating/preprocessing, extraction, matching and persistence
++requirements. Applying the SIGFM branch wholesale would not implement those
++contracts or preserve the current profile-9 stack.
++
++Our observations came from Dell package KP8ND 3.31.30.110 A08. The maintainer's
++research uses DLL pair 2.0.310.900. In particular, the prototype's two-byte
++image request and the handoff's four-byte request must be reconciled rather
++than silently treated as interchangeable. The prototype's image fusion and
++eight-stage enrollment are not evidence of native Milan behavior.
++
++## Proposed integration sequence
++
++1. Discuss a bounded profile-0 implementation and validation proposal in the
++   issue, using this prototype as evidence and the upstream handoff as the base.
++2. Establish isolated profile-0 native-oracle execution and comparison policy.
++3. Introduce verified profile/subtype selection and ownership boundaries with
++   profile 9 remaining the only enabled implementation; preserve its behavior.
++4. Port verified calibration and capture semantics in a small change, then
++   implement the separate preprocessing and algorithm differences. Do not
++   copy speculative image reconstruction or relax compatibility gates.
++5. Integrate profile-aware print/cache and diagnostic/parity handling; preserve
++   existing profile-9 prints and evidence contracts.
++6. Validate native parity and physical lifecycle behavior before enabling 5381.
++
++A draft implementation PR should follow a reviewable, tested adaptation on the
++target stack. This assessment does not claim such an adaptation is complete.
++The current publication intentionally leaves the installed prototype untouched.
+diff --git a/docs/trabajo-realizado-27c6-5381.md b/docs/trabajo-realizado-27c6-5381.md
+index 61fb8ae..48f5ce3 100644
+--- a/docs/trabajo-realizado-27c6-5381.md
++++ b/docs/trabajo-realizado-27c6-5381.md
+@@ -1,5 +1,13 @@
+ # Trabajo realizado para habilitar el lector Goodix 27c6:5381
+ 
++> Informe histórico de las primeras pruebas. Las rutas, el hash de biblioteca y
++> la instalación descritos corresponden a aquella sesión, no al estado actual.
++> Después aparecieron fallos intermitentes de reconocimiento, incluso tras
++> reiniciar el servicio. La interpretación de la imagen descrita aquí sigue
++> siendo una hipótesis del prototipo. Consulta las
++> [notas actualizadas](27c6-5381-porting.md) y la
++> [evaluación para contribuir a Milan](5381-milan-contribution.md).
++
+ ## Resultado actual
+ 
+ El lector de huellas del Dell G5 15 5587 ya es reconocido por `fprintd` como:
+@@ -228,7 +236,7 @@ sudo fprintd-list aitor
+ Probar el índice derecho:
+ 
+ ```bash
+-sudo fprintd-verify aitor
++fprintd-verify -f right-index-finger "$USER"
+ ```
+ 
+ Tras `Verify started!`, hay que colocar el índice derecho centrado y cubrir la
+@@ -271,4 +279,3 @@ Las imágenes y plantillas temporales utilizadas para estudiar el formato se
+ eliminaron. `test-storage.variant` se añadió a `.gitignore` para impedir su
+ inclusión accidental. No se guardaron capturas biométricas ni plantillas en los
+ commits del repositorio.
+-
+diff --git a/drivers/goodix53x5/goodix53x5-auth.c b/drivers/goodix53x5/goodix53x5-auth.c
+index 9198d5c..bbb6af1 100644
+--- a/drivers/goodix53x5/goodix53x5-auth.c
++++ b/drivers/goodix53x5/goodix53x5-auth.c
+@@ -439,7 +439,11 @@ goodix_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   self->task_ssm = NULL;
+   self->blocking_ssm = NULL;
+-  g_clear_pointer (&self->reference_image, g_free);
++  /* Keep the pre-touch reference for fprintd's IDENTIFY -> ENROLL duplicate
++   * check transition. Other actions and close discard it as usual. */
++  if (error != NULL || action != FPI_DEVICE_ACTION_IDENTIFY ||
++      !(fpi_device_get_driver_data (dev) & GOODIX53X5_FLAG_MILAN_F_5381))
++    g_clear_pointer (&self->reference_image, g_free);
+   g_clear_pointer (&self->captured_image, g_free);
+ 
+   if (error)
+diff --git a/drivers/goodix53x5/goodix53x5-enroll.c b/drivers/goodix53x5/goodix53x5-enroll.c
+index 5765c79..fa1c0f7 100644
+--- a/drivers/goodix53x5/goodix53x5-enroll.c
++++ b/drivers/goodix53x5/goodix53x5-enroll.c
+@@ -256,7 +256,15 @@ goodix_enroll_start (FpDevice *dev)
+   self->cancel = g_cancellable_new ();
+ 
+   self->enroll_stage = 0;
+-  g_clear_pointer (&self->reference_image, g_free);
++  /* fprintd identifies the finger before enrolling it. The 5381 can report
++   * finger-up prematurely, so a fresh reference here can contain the finger.
++   * Reuse the pre-touch reference from the successful duplicate check, but
++   * never carry it through a required hardware reinitialization. */
++  if (self->needs_reinit ||
++      !(fpi_device_get_driver_data (dev) & GOODIX53X5_FLAG_MILAN_F_5381))
++    g_clear_pointer (&self->reference_image, g_free);
++  if (self->reference_image != NULL)
++    fp_dbg ("Enrollment reusing pre-touch reference from duplicate check");
+   g_clear_pointer (&self->captured_image, g_free);
+   g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+   self->enroll_features = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+diff --git a/drivers/goodix53x5/goodix53x5-scan.c b/drivers/goodix53x5/goodix53x5-scan.c
+index 8b48606..0cfdade 100644
+--- a/drivers/goodix53x5/goodix53x5-scan.c
++++ b/drivers/goodix53x5/goodix53x5-scan.c
+@@ -372,7 +372,11 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
+ 
+           g_free (img12);
+           g_free (decrypted);
+-          if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
++          /* Preserve the pre-touch frame for the 5381 IDENTIFY -> ENROLL
++           * transition used by fprintd's duplicate check. */
++          if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL &&
++              !(fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY &&
++                (fpi_device_get_driver_data (dev) & GOODIX53X5_FLAG_MILAN_F_5381)))
+             g_clear_pointer (&self->reference_image, g_free);
+ 
+           /* Store native 8-bit image for SIGFM matching */
+-- 
+2.55.0
+
