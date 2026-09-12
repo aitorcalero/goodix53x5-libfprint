@@ -24,6 +24,10 @@
 guint16 *goodix_device_decode_image (const guint8 *data,
                                      gsize         data_len);
 
+void     goodix_device_deinterleave_milan_f_5381 (guint16 *image);
+
+void     goodix_device_canonicalize_milan_f_5381 (guint8 *image);
+
 guint8  *goodix_device_image_to_8bit (const guint16 *img12,
                                       const guint16 *calib_img);
 
