@@ -11,3 +11,6 @@ results/
 tools/
 AGENTS.md
 *.pkg.tar.zst
+
+# Local biometric enrollment data
+test-storage.variant
