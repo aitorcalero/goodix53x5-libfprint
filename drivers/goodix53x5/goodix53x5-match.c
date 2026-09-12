@@ -31,7 +31,7 @@
  * to compare against newly enrolled templates. */
 #define GOODIX_SIGFM_TEMPLATE_MAGIC      "G53S"
 #define GOODIX_SIGFM_TEMPLATE_MAGIC_LEN  4
-#define GOODIX_SIGFM_TEMPLATE_VERSION    1
+#define GOODIX_SIGFM_TEMPLATE_VERSION    3
 #define GOODIX_SIGFM_TEMPLATE_HEADER_LEN \
   (GOODIX_SIGFM_TEMPLATE_MAGIC_LEN + sizeof (guint16))
 #define GOODIX_SIGFM_TEMPLATE_MAX_LEN    (1024 * 1024)
@@ -137,6 +137,9 @@ goodix_match_serialized_feature (GoodixMatchInfo *probe_info,
   if (tmpl_info == NULL)
     return status;
 
+  fp_dbg ("SIGFM keypoints: probe=%d template=%d",
+          sigfm_keypoints_count (probe_info),
+          sigfm_keypoints_count (tmpl_info));
   *score = sigfm_match_score (probe_info, tmpl_info);
   sigfm_free_info (tmpl_info);
   if (*score < 0)
