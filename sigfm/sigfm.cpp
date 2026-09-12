@@ -28,6 +28,7 @@
 #include "opencv2/features2d.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -99,7 +100,7 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
 namespace {
 constexpr auto distance_match = 0.85;
 constexpr auto length_match = 0.05;
-constexpr auto angle_match = 0.05;
+constexpr auto angle_tol_rad = 0.10;
 constexpr auto min_match = 5;
 constexpr auto sift_nfeatures = 0;
 constexpr auto sift_octave_layers = 3;
@@ -292,12 +293,15 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
                     length_match) {
 
                     double product = length_1 * length_2;
+                    auto clamp1 = [](double value) {
+                        return std::clamp(value, -1.0, 1.0);
+                    };
                     angles.emplace_back(angle(
                         M_PI / 2 +
-                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
-                                 product),
-                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
-                             product),
+                            asin(clamp1((vec_1[0] * vec_2[0] +
+                                         vec_1[1] * vec_2[1]) / product)),
+                        acos(clamp1((vec_1[0] * vec_2[1] -
+                                     vec_1[1] * vec_2[0]) / product)),
                         match_1, match_2));
                 }
             }
@@ -313,12 +317,8 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
             for (std::size_t k = j + 1; k < angles.size(); k++) {
                 angle angle_2 = angles[k];
 
-                if (1 - std::min(angle_1.sin, angle_2.sin) /
-                                std::max(angle_1.sin, angle_2.sin) <=
-                        angle_match &&
-                    1 - std::min(angle_1.cos, angle_2.cos) /
-                                std::max(angle_1.cos, angle_2.cos) <=
-                        angle_match) {
+                if (std::fabs(angle_1.sin - angle_2.sin) <= angle_tol_rad &&
+                    std::fabs(angle_1.cos - angle_2.cos) <= angle_tol_rad) {
 
                     count += 1;
                 }
