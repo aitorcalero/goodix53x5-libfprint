@@ -147,6 +147,8 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
+        fp_dbg ("Reference frame decrypted length: %zu", dec_len);
+
         img12 = goodix_device_decode_image (decrypted, dec_len);
         if (img12 == NULL)
           {
@@ -155,6 +157,10 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
                                                            "Reference image decode failed"));
             return;
           }
+
+        if ((fpi_device_get_driver_data (dev) &
+             GOODIX53X5_FLAG_MILAN_F_5381) != 0)
+          goodix_device_deinterleave_milan_f_5381 (img12);
 
         g_clear_pointer (&self->reference_image, g_free);
         self->reference_image = g_steal_pointer (&img12);
@@ -326,6 +332,8 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
+        fp_dbg ("Capture frame decrypted length: %zu", dec_len);
+
         /* Decode 12-bit and convert to 8-bit */
         {
           guint16 *img12 = goodix_device_decode_image (decrypted, dec_len);
@@ -339,6 +347,10 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
                                                              "Capture image decode failed"));
               return;
             }
+
+          if ((fpi_device_get_driver_data (dev) &
+               GOODIX53X5_FLAG_MILAN_F_5381) != 0)
+            goodix_device_deinterleave_milan_f_5381 (img12);
 
           if (self->reference_image == NULL)
             {
@@ -354,9 +366,18 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
           self->captured_clipped_fraction =
             goodix_device_image_clipped_fraction (img12);
 
+          if ((fpi_device_get_driver_data (dev) &
+               GOODIX53X5_FLAG_MILAN_F_5381) != 0)
+            goodix_device_canonicalize_milan_f_5381 (img8);
+
           g_free (img12);
           g_free (decrypted);
-          g_clear_pointer (&self->reference_image, g_free);
+          /* Preserve the pre-touch frame for the 5381 IDENTIFY -> ENROLL
+           * transition used by fprintd's duplicate check. */
+          if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL &&
+              !(fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY &&
+                (fpi_device_get_driver_data (dev) & GOODIX53X5_FLAG_MILAN_F_5381)))
+            g_clear_pointer (&self->reference_image, g_free);
 
           /* Store native 8-bit image for SIGFM matching */
           g_free (self->captured_image);
