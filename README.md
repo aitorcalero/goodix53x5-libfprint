@@ -1,18 +1,46 @@
-# Goodix HTK32 (27c6:5335 / 27c6:5385 / 27c6:5395) libfprint Driver
+# Goodix HTK32 (27c6:5335 / 27c6:5381 / 27c6:5385 / 27c6:5395) libfprint Driver
 
-A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570** and possibly other laptops using the `27c6:5335`, `27c6:5385` or `27c6:5395` USB device.
+A libfprint driver for the Goodix HTK32 fingerprint sensor found in the **Dell XPS 13 9305**, the **Dell XPS 13 7390**, the **Dell XPS 15 9570**, the **Dell G5 15 5587** and possibly other laptops using the `27c6:5335`, `27c6:5381`, `27c6:5385` or `27c6:5395` USB device. Support for `27c6:5381` is experimental and guards persistent PSK changes behind a separate opt-in.
 
 ## Hardware
 
 - **Vendor ID:** `0x27c6`
-- **Product IDs:** `0x5335`, `0x5385`, `0x5395`
+- **Product IDs:** `0x5335`, `0x5381` (experimental), `0x5385`, `0x5395`
 - **Sensor:** 108 x 88 pixels, capacitive press-type
-- **Known devices:** Dell XPS 13 9305, Dell XPS 13 7390 2-in-1, Dell XPS 15 9570
+- **Known devices:** Dell XPS 13 9305, Dell XPS 13 7390 2-in-1, Dell XPS 15 9570, Dell G5 15 5587
 
 Check if you have this sensor:
 ```
-lsusb | grep -E '27c6:(5335|5385|5395)'
+lsusb | grep -E '27c6:(5335|5381|5385|5395)'
 ```
+
+### Experimental 27c6:5381 support
+
+This branch is an **experimental SIGFM prototype based on AndyHazz's driver**,
+not a port to seaweeduk's native Milan stack. Successful enrollments and matches
+have been observed, but intermittent `verify-no-match` results remain, including
+after a service restart. Repeated recognition and unregistered-finger rejection
+are not yet validated. See the [Milan contribution assessment](docs/5381-milan-contribution.md)
+before proposing these commits for integration.
+
+The `27c6:5381` uses the Milan F protocol variant, configuration table entry 0
+and chip ID `0x002202a0`. Initialization, GTLS, FDT setup, encrypted capture,
+eight-stage enrollment and live verification have succeeded on one Dell
+G5 15 5587. The prototype applies a device-specific 2x2 deinterleave and
+fusion of two 54x88 halves before feature extraction; this reconstruction has
+not been established as native-driver parity. Support still
+needs testing on more devices and fingers, so the driver refuses full
+initialization unless `GOODIX53X5_ALLOW_FULL_INIT=1` is present in the
+`fprintd` environment. If the PSK also needs replacement, the separate
+`GOODIX53X5_ALLOW_PSK_WRITE=1` opt-in is required before the potentially
+irreversible change needed for the GTLS handshake.
+
+Only after reviewing a successful probe should a tester enable either option.
+A PSK replacement can affect compatibility with the Windows driver and must
+not be enabled merely to see whether the device is detected.
+
+See [`docs/27c6-5381-porting.md`](docs/27c6-5381-porting.md) for the hardware
+probe and calibration evidence behind this experimental entry.
 
 ## How It Works
 
