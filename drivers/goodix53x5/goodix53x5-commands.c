@@ -227,6 +227,18 @@ goodix_cmd_request_image (FpiSsm *ssm, FpDevice *dev,
                           gboolean tx_enable, gboolean hv_enable,
                           gboolean is_finger, guint16 dac)
 {
+  /* Milan F (chip 0x2202 / USB 5381) has a separate image-prepare
+   * operation.  The official PID5381 driver always sends { 0x01, 0x00 }
+   * here; the four-byte mode/HV/DAC request belongs to Milan FNHV. */
+  if ((fpi_device_get_driver_data (dev) &
+       GOODIX53X5_FLAG_MILAN_F_5381) != 0)
+    {
+      guint8 img_req[2] = { 0x01, 0x00 };
+
+      goodix_run_cmd (ssm, dev, 0x2, 0x0, img_req, sizeof (img_req), TRUE);
+      return;
+    }
+
   guint8 img_req[4];
 
   goodix_build_image_request (tx_enable, hv_enable, is_finger, dac, img_req);
